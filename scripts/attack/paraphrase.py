@@ -43,13 +43,19 @@ import pandas as pd
 
 SYSTEM_PROMPT = "You are a careful text rewriting tool. You output only the rewritten text."
 
+FIDELITY_RULE = (
+    "Do not add any name, fact, event, or detail that is not already in the passage, even "
+    "if it seems like a natural comparison or elaboration. Every person, place, and claim "
+    "in your rewrite must already be present in the original."
+)
+
 PROMPTS = {
     # Reword and restructure, keep the register
     "light": (
         "Rewrite the passage below in your own words. Keep every fact and the overall "
         "meaning, keep roughly the same length, and change the wording and sentence "
-        "structure wherever it reads naturally. Output only the rewritten passage, with "
-        "no introduction or commentary.\n\nPassage:\n{chunk}"
+        f"structure wherever it reads naturally. {FIDELITY_RULE} Output only the rewritten "
+        "passage, with no introduction or commentary.\n\nPassage:\n{chunk}"
     ),
     # Evasion-style: strip the register detectors key on
     "heavy": (
@@ -57,8 +63,8 @@ PROMPTS = {
         "rather than an AI assistant: vary the sentence lengths, use plain everyday "
         "wording, drop stock phrases and formal transitions, and reorder or merge ideas "
         "where that reads naturally. Keep every fact and the overall meaning, and keep "
-        "roughly the same length. Output only the rewritten passage, with no introduction "
-        "or commentary.\n\nPassage:\n{chunk}"
+        f"roughly the same length. {FIDELITY_RULE} Output only the rewritten passage, with "
+        "no introduction or commentary.\n\nPassage:\n{chunk}"
     ),
 }
 
@@ -98,6 +104,59 @@ def clean_output(text: str) -> str:
     if len(text) > 1 and text[0] in "\"“" and text[-1] in "\"”":
         text = text[1:-1].strip()
     return text
+
+
+_COMMON_CAPITALIZED = {"i", "i'm", "i'll", "i've", "i'd"}
+
+# Common words that legitimately open a sentence, so a sentence-initial word
+# is only treated as a possible proper noun if it ISN'T one of these -- lets
+# capitalized_words() also catch a hallucinated name that opens a sentence
+# (e.g. "Smith filed the report.") without flagging every rephrased sentence
+# that happens to start with "The", "However", etc. Not exhaustive by design:
+# a miss here just means a sentence-initial hallucination slips through, same
+# as if this list didn't exist at all.
+_COMMON_SENTENCE_STARTERS = {
+    "the", "this", "that", "these", "those", "it", "its", "he", "she", "they",
+    "we", "you", "there", "here", "then", "now", "so", "but", "and", "or",
+    "yet", "still", "thus", "therefore", "however", "meanwhile", "moreover",
+    "furthermore", "indeed", "finally", "first", "second", "third", "next",
+    "last", "also", "perhaps", "maybe", "certainly", "clearly", "obviously",
+    "sometimes", "often", "usually", "occasionally", "eventually", "suddenly",
+    "later", "earlier", "afterward", "afterwards", "before", "after", "when",
+    "while", "since", "once", "although", "though", "because", "if", "unless",
+    "despite", "instead", "overall", "as", "well", "yes", "no", "one", "two",
+    "three", "some", "many", "most", "all", "each", "every", "another",
+    "other", "such", "in", "on", "at", "for", "with", "without", "according",
+    "there's", "it's", "that's", "he's", "she's", "they're", "we're", "you're",
+    "here's", "what's", "who's",
+}
+
+
+def capitalized_words(text: str) -> set[str]:
+    """Capitalized word tokens in `text` that look like they could be proper
+    nouns: either they occur away from the start of a sentence, or they open a
+    sentence with a word that isn't a common sentence-starter (catches a
+    hallucinated name that happens to begin a sentence, e.g. "Smith filed the
+    report.", without flagging ordinary sentence-initial words like "The")."""
+    found = set()
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        for i, w in enumerate(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", sentence)):
+            if not w[0].isupper() or w.lower() in _COMMON_CAPITALIZED:
+                continue
+            if i > 0 or w.lower() not in _COMMON_SENTENCE_STARTERS:
+                found.add(w)
+    return found
+
+
+def new_names(orig_text: str, paraphrase: str) -> list[str]:
+    """Capitalized words in the paraphrase that never appear (in any position, any
+    case) anywhere in the original -- a cheap screen for invented names/places.
+    Heuristic: misses a hallucinated name that only occurs at a sentence start in
+    the paraphrase, and can flag a genuine name that only ever appeared at a
+    sentence start in the original. Meant to prioritize documents for a human to
+    read, not as a hard filter."""
+    orig_lower = orig_text.lower()
+    return sorted(w for w in capitalized_words(paraphrase) if w.lower() not in orig_lower)
 
 
 def make_generator(args):
@@ -230,10 +289,16 @@ def build_output(targets, humans, records: dict, args) -> pd.DataFrame:
     for col in ("para_word_ratio", "para_similarity", "paraphrase_ok"):
         attacked[col] = attacked["text_id"].map(rec[col])
     attacked["attack_strength"] = args.strength
+    # Cheap screen for the paraphraser inventing names/places not in the source
+    # (see new_names() docstring for what this heuristic does and doesn't catch)
+    invented = attacked.apply(lambda r: new_names(r["orig_text"], r["text"]), axis=1)
+    attacked["new_names"] = invented.map(lambda ns: ", ".join(ns))
+    attacked["n_new_names"] = invented.map(len)
 
     kept = prepare(humans)
     kept["para_word_ratio"], kept["para_similarity"], kept["paraphrase_ok"] = 1.0, 1.0, True
     kept["attack_strength"] = "none"
+    kept["new_names"], kept["n_new_names"] = "", 0
     return pd.concat([attacked, kept], ignore_index=True)
 
 
@@ -298,6 +363,9 @@ def main():
     print(f"  paraphrase_ok: {attacked['paraphrase_ok'].mean():.1%}   (length ratio 0.5-1.6, no empty chunks)")
     print(f"  median word-length ratio: {attacked['para_word_ratio'].median():.2f}")
     print(f"  median similarity to original: {attacked['para_similarity'].median():.2f}   (lower = more rewritten)")
+    with_new_names = (attacked["n_new_names"] > 0).mean()
+    print(f"  possible invented names: {with_new_names:.1%} of documents flag >=1 (heuristic, read new_names column;"
+          f" see docstring on new_names() for what it can miss/false-positive on)")
 
 
 if __name__ == "__main__":
