@@ -106,7 +106,17 @@ def clean_output(text: str) -> str:
     return text
 
 
-_COMMON_CAPITALIZED = {"i", "i'm", "i'll", "i've", "i'd"}
+# Never proper nouns regardless of position, so always exempt -- unlike the
+# sentence-starter list this replaced, this is a small closed set (pronoun/
+# common-word contractions) rather than an attempt to cover ordinary
+# vocabulary, so it doesn't reintroduce that trade-off.
+_COMMON_CAPITALIZED = {
+    "i", "i'm", "i'll", "i've", "i'd",
+    "there's", "here's", "it's", "that's", "what's", "who's", "he's", "she's",
+    "we're", "they're", "you're", "that'll", "won't", "don't", "can't",
+    "isn't", "aren't", "wasn't", "weren't", "didn't", "doesn't", "haven't",
+    "hasn't", "hadn't", "wouldn't", "couldn't", "shouldn't",
+}
 
 
 def _normalize_apostrophes(text: str) -> str:
@@ -134,36 +144,48 @@ def capitalized_words(text: str) -> set[str]:
         for i, w in enumerate(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", sentence)):
             if not w[0].isupper() or w.lower() in _COMMON_CAPITALIZED:
                 continue
+            if w.isupper():
+                continue  # an acronym (TV, UK, FBI...), not the Title Case a real name would take
             if i > 0:
                 found.add(w)
     return found
 
 
-def _strip_possessive(word: str) -> str:
+def _normalized_forms(word: str) -> set[str]:
+    """A word's lowercased form, plus a possessive- and simple-plural-stripped
+    form, so e.g. "Westbury's" matches an original that has "Westbury", and
+    "Exams" matches an original that only ever says "exam". Doesn't handle
+    other derived forms (e.g. "Russians" from "Russia") -- diminishing returns
+    past this point without real morphological analysis."""
     lower = word.lower()
+    forms = {lower}
     for suffix in ("'s", "s'"):
         if lower.endswith(suffix):
-            return lower[: -len(suffix)]
-    return lower
+            forms.add(lower[: -len(suffix)])
+    if lower.endswith("es") and len(lower) > 3:
+        forms.add(lower[:-2])
+    if lower.endswith("s") and len(lower) > 2:
+        forms.add(lower[:-1])
+    return forms
 
 
 def new_names(orig_text: str, paraphrase: str) -> list[str]:
-    """Capitalized words in the paraphrase that never appear (in any form, any
-    position, any case) anywhere in the original -- a cheap screen for invented
-    names/places. Checks both the word as-is and with a trailing possessive 's
-    stripped, so a possessive of a name already in the original (e.g. original
-    has "Westbury", paraphrase has "Westbury's") isn't flagged.
+    """Capitalized words in the paraphrase that never appear (in any of the
+    forms _normalized_forms() tries, any position, any case) anywhere in the
+    original -- a cheap screen for invented names/places.
 
     Heuristic, not a hard filter: misses a hallucinated name that only occurs at
-    the very start of a sentence in the paraphrase (see capitalized_words), and
-    can flag a genuine name if the paraphrase's rewrite lands it right after a
+    the very start of a sentence in the paraphrase (see capitalized_words), can
+    flag a genuine name if the paraphrase's rewrite lands it right after a
     quote, colon or dash in a way this function's naive '.!?'-only sentence
-    splitting treats as "mid-sentence" -- read the new_names column, don't treat
-    a nonzero count as confirmed."""
+    splitting treats as "mid-sentence", and won't catch a derived form (a
+    demonym like "Russians" from "Russia") that _normalized_forms() doesn't
+    cover. Read the new_names column; don't treat a nonzero count as
+    confirmed."""
     orig_lower = _normalize_apostrophes(orig_text).lower()
     return sorted(
         w for w in capitalized_words(paraphrase)
-        if w.lower() not in orig_lower and _strip_possessive(w) not in orig_lower
+        if not any(form in orig_lower for form in _normalized_forms(w))
     )
 
 
