@@ -108,55 +108,63 @@ def clean_output(text: str) -> str:
 
 _COMMON_CAPITALIZED = {"i", "i'm", "i'll", "i've", "i'd"}
 
-# Common words that legitimately open a sentence, so a sentence-initial word
-# is only treated as a possible proper noun if it ISN'T one of these -- lets
-# capitalized_words() also catch a hallucinated name that opens a sentence
-# (e.g. "Smith filed the report.") without flagging every rephrased sentence
-# that happens to start with "The", "However", etc. Not exhaustive by design:
-# a miss here just means a sentence-initial hallucination slips through, same
-# as if this list didn't exist at all.
-_COMMON_SENTENCE_STARTERS = {
-    "the", "this", "that", "these", "those", "it", "its", "he", "she", "they",
-    "we", "you", "there", "here", "then", "now", "so", "but", "and", "or",
-    "yet", "still", "thus", "therefore", "however", "meanwhile", "moreover",
-    "furthermore", "indeed", "finally", "first", "second", "third", "next",
-    "last", "also", "perhaps", "maybe", "certainly", "clearly", "obviously",
-    "sometimes", "often", "usually", "occasionally", "eventually", "suddenly",
-    "later", "earlier", "afterward", "afterwards", "before", "after", "when",
-    "while", "since", "once", "although", "though", "because", "if", "unless",
-    "despite", "instead", "overall", "as", "well", "yes", "no", "one", "two",
-    "three", "some", "many", "most", "all", "each", "every", "another",
-    "other", "such", "in", "on", "at", "for", "with", "without", "according",
-    "there's", "it's", "that's", "he's", "she's", "they're", "we're", "you're",
-    "here's", "what's", "who's",
-}
+
+def _normalize_apostrophes(text: str) -> str:
+    return text.replace("’", "'").replace("‘", "'")
 
 
 def capitalized_words(text: str) -> set[str]:
-    """Capitalized word tokens in `text` that look like they could be proper
-    nouns: either they occur away from the start of a sentence, or they open a
-    sentence with a word that isn't a common sentence-starter (catches a
-    hallucinated name that happens to begin a sentence, e.g. "Smith filed the
-    report.", without flagging ordinary sentence-initial words like "The")."""
+    """Capitalized word tokens in `text` that occur away from the start of a
+    sentence -- a cheap way to exclude ordinary sentence-initial capitals (which
+    include, in real text, all sorts of ordinary nouns/verbs a rephrase can land
+    at the front of a new sentence, not just "The"/"However"-type words -- a
+    fixed word list can't cover that) and keep tokens capitalized because
+    they're proper nouns.
+
+    Known gap: a sentence-initial hallucination (e.g. "Smith filed the
+    report.") isn't caught. Tried filtering by a common-sentence-starter word
+    list instead, but on real text that flagged far more ordinary words than
+    it caught real hallucinations, so it isn't worth the noise; this simpler
+    away-from-sentence-start rule is what actually caught the one confirmed
+    hallucination seen so far, which was mid-sentence.
+    """
+    text = _normalize_apostrophes(text)
     found = set()
     for sentence in re.split(r"(?<=[.!?])\s+", text):
         for i, w in enumerate(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", sentence)):
             if not w[0].isupper() or w.lower() in _COMMON_CAPITALIZED:
                 continue
-            if i > 0 or w.lower() not in _COMMON_SENTENCE_STARTERS:
+            if i > 0:
                 found.add(w)
     return found
 
 
+def _strip_possessive(word: str) -> str:
+    lower = word.lower()
+    for suffix in ("'s", "s'"):
+        if lower.endswith(suffix):
+            return lower[: -len(suffix)]
+    return lower
+
+
 def new_names(orig_text: str, paraphrase: str) -> list[str]:
-    """Capitalized words in the paraphrase that never appear (in any position, any
-    case) anywhere in the original -- a cheap screen for invented names/places.
-    Heuristic: misses a hallucinated name that only occurs at a sentence start in
-    the paraphrase, and can flag a genuine name that only ever appeared at a
-    sentence start in the original. Meant to prioritize documents for a human to
-    read, not as a hard filter."""
-    orig_lower = orig_text.lower()
-    return sorted(w for w in capitalized_words(paraphrase) if w.lower() not in orig_lower)
+    """Capitalized words in the paraphrase that never appear (in any form, any
+    position, any case) anywhere in the original -- a cheap screen for invented
+    names/places. Checks both the word as-is and with a trailing possessive 's
+    stripped, so a possessive of a name already in the original (e.g. original
+    has "Westbury", paraphrase has "Westbury's") isn't flagged.
+
+    Heuristic, not a hard filter: misses a hallucinated name that only occurs at
+    the very start of a sentence in the paraphrase (see capitalized_words), and
+    can flag a genuine name if the paraphrase's rewrite lands it right after a
+    quote, colon or dash in a way this function's naive '.!?'-only sentence
+    splitting treats as "mid-sentence" -- read the new_names column, don't treat
+    a nonzero count as confirmed."""
+    orig_lower = _normalize_apostrophes(orig_text).lower()
+    return sorted(
+        w for w in capitalized_words(paraphrase)
+        if w.lower() not in orig_lower and _strip_possessive(w) not in orig_lower
+    )
 
 
 def make_generator(args):
