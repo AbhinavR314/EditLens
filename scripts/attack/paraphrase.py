@@ -131,16 +131,20 @@ def capitalized_words(text: str) -> set[str]:
     fixed word list can't cover that) and keep tokens capitalized because
     they're proper nouns.
 
-    Known gap: a sentence-initial hallucination (e.g. "Smith filed the
+    Known gaps: a sentence-initial hallucination (e.g. "Smith filed the
     report.") isn't caught. Tried filtering by a common-sentence-starter word
     list instead, but on real text that flagged far more ordinary words than
     it caught real hallucinations, so it isn't worth the noise; this simpler
     away-from-sentence-start rule is what actually caught the one confirmed
-    hallucination seen so far, which was mid-sentence.
+    hallucination seen so far, which was mid-sentence. Splitting on newlines
+    too (below) catches most markdown-header/dateline-driven false positives,
+    but a run-on line with no line break and no [.!?] until well past its real
+    first clause (rare, but happens) can still misplace where "sentence start"
+    falls.
     """
     text = _normalize_apostrophes(text)
     found = set()
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
         for i, w in enumerate(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", sentence)):
             if not w[0].isupper() or w.lower() in _COMMON_CAPITALIZED:
                 continue
